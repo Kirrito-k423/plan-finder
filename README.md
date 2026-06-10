@@ -1,0 +1,330 @@
+# codex_finder
+
+跨 SSH 扫描 Codex CLI 凭证残留工具。在多台远程服务器上登录(每台可独立配置认证),遍历所有用户、home 目录、Docker 容器、npm/pip 全局安装、shell history,定位与 Codex / OpenAI 相关的凭证文件和环境变量。
+
+> **定位**:一次性盘点工具,用于找回被遗忘在远程机器上的 Codex 凭证。请勿在生产环境长期挂载运行。扫描本身只读取元数据,报告中所有凭证值已脱敏。
+
+## 功能
+
+- **YAML 配置**:`servers.yaml` 列出每台机器的 `name` / `host` / `user` / `identity_file` / `bootstrap_password_secret`,格式与 autoresearch 的 `servers` schema 兼容 (D-03 Bootstrap-then-Key)
+- **SSH 认证流程**:
+  1. 先尝试 `identity_file` 公钥认证(同时启用 SSH agent)
+  2. 失败回落到 `bootstrap_password_secret` 密码认证
+  3. 都没有时尝试 agent + `~/.ssh/` 默认 key
+- **跳板支持**:`jump.host` 或 `--jump HOST` 走 SSH ProxyCommand
+- **覆盖范围**:
+  - `~/.codex/` 目录及 `auth.json` / `config.toml` 元信息
+  - 用户 shell 启动文件(`.bashrc` / `.zshrc` / `.profile` 等)中的 `OPENAI_API_KEY` 等,**定位到具体文件 + 行号**
+  - `/etc/environment`、`/etc/profile`、`/etc/profile.d/*` 等系统级配置
+  - `~/.bash_history` / `~/.zsh_history` 中的 codex / openai 痕迹,**`export *KEY` 和 `codex login` 自动升级到 HIGH + 标记 URGENT**
+  - `~/.npmrc` 中的 `_authToken`
+  - 全局安装的 `codex` / `@openai/codex` (npm) 和 `codex` (pip)
+  - **Docker 容器内**:running 容器内的 `~/.codex/`、env、全局 npm;stopped 容器列出 volume 挂载点
+- **去重**:同 `(location, path, kind)` 合并,`user` 字段用逗号列所有匹配用户(operator 和 root 都用 `/root` 不会再出两份)
+- **复制到 result_dir**:`--result-dir PATH`,把工件按 host/category 分类落到本地,目录 0700 + 文件 0600,`auth.json` / 实际 env 值都落盘(本地权限保护)
+- **URGENT 子目录**:`export X_API_KEY` / `codex login` 这类 history 单独存到 `result_dir/URGENT/`,便于快速 triage
+- **测试 key 有效性**:`--test-credentials`,对每个候选 key 调 `GET /v1/models` 验(200=有效,401=失效),自动读 `HTTPS_PROXY`/`TEST_PROXY` 走 7890 代理
+- **脱敏输出**:终端/JSON 报告中所有凭证值只保留首 4 + 末 2 字符
+- **JSON 报告**:`output: findings.json` 自动落盘
+- **分级**:high / medium / low / info 四档,按降序展示
+
+## 安装
+
+项目使用 Python 3.8+、paramiko、PyYAML。
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+国内网络可加代理:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 .venv/bin/pip install -r requirements.txt
+```
+
+## 快速开始
+
+### 1. 生成 servers.yaml
+
+```bash
+.venv/bin/python codex_finder.py --init-to servers.yaml
+```
+
+### 2. 编辑 servers.yaml
+
+每台服务器独立配置认证:
+
+```yaml
+servers:
+  - name: A2-AK-225
+    host: 192.168.9.225
+    port: 22
+    user: root
+    identity_file: ~/.ssh/id_ed25519
+    # 首次连接一次性密码 (bootstrap 阶段用, 部署完 key 后可删)
+    bootstrap_password_secret: "<填入或留空>"
+
+  - name: A2-AK-176
+    host: 192.168.9.102
+    port: 22
+    user: admin123            # 非 root 用户也可
+    identity_file: ~/.ssh/id_ed25519
+    bootstrap_password_secret: "<填入或留空>"
+
+# --- 跳板机 (可选) ---
+jump:
+  host: 192.168.13.154
+  port: 22
+  user: root
+  identity_file: ~/.ssh/id_ed25519
+  # password: ""  # 跳板用密码时填这里(需本机有 sshpass)
+
+# --- 扫描行为 (可省,均有默认值) ---
+scan:
+  parallel: 4
+  scan_docker: true
+  scan_history: true
+  scan_npm_pip: true
+  verbose: false
+
+# --- JSON 报告 (留空不输出) ---
+output: findings.json
+```
+
+**重要**:`servers.yaml` 已在 `.gitignore` 中,不要 commit。`bootstrap_password_secret` 是 bootstrap 阶段的一次性密码,key 部署完后应删除该字段并轮换真实密码。
+
+### 3. 连通性预检
+
+```bash
+.venv/bin/python codex_finder.py --check
+```
+
+逐台尝试 SSH,显示用 `key` / `password` / `agent` 哪种方式连上,打印 `uname -a`,不执行扫描。`--list-servers` 可以不连任何机器就列出所有目标。
+
+### 4. 扫描
+
+```bash
+# 从本机直接连(走 SSH 密钥 / agent / bootstrap 密码)
+.venv/bin/python codex_finder.py
+
+# 通过跳板机(覆盖 YAML 中的 jump.host)
+.venv/bin/python codex_finder.py --jump 192.168.13.154
+
+# 只扫单台(覆盖 YAML)
+.venv/bin/python codex_finder.py --host 10.0.0.5:2222
+
+# 把工件复制到 ./findings,按 host/category 分类(mode 0700)
+.venv/bin/python codex_finder.py --result-dir ./findings
+
+# 对每个候选 key 测是否还有效(自动走 7890 代理)
+export TEST_PROXY=http://127.0.0.1:7890
+.venv/bin/python codex_finder.py --test-credentials
+
+# 三个一起
+.venv/bin/python codex_finder.py --result-dir ./findings --test-credentials
+
+# 关闭彩色输出
+.venv/bin/python codex_finder.py --no-color
+```
+
+报告示例(终端):
+
+```
+→ 扫描 A2-AK-225 (root@192.168.9.225:22)  [key✓(id_ed25519)+pwd✓]
+  ✓ 连接成功 [auth=key]  uname: Linux server1 6.1.0...
+  [用户] 发现 3 个账号 (并行度 4)
+  [docker] 发现 5 个容器
+══════════════════════════════════════════════
+  Codex 凭证扫描报告
+══════════════════════════════════════════════
+  扫描主机: 5    失败: 0    命中: 2 高 / 1 中 / 0 低 / 8 信息
+
+▸ A2-AK-225 (root@192.168.9.225:22)  (4 项)
+    [HIGH  ] <host_home> root  /root/.codex
+             .codex/ 目录存在 (4 项, auth.json=有(312B))
+    [HIGH  ] <host_home> alice  <shell rc>
+             OPENAI_API_KEY=sk-1T***8z
+    [MEDIUM] <host_npm>  root  /usr/lib/node_modules/@openai/codex
+             npm 全局包: @openai/codex
+```
+
+JSON 报告(由 `output: findings.json` 控制):
+
+```json
+{
+  "generated": "2026-06-10T10:50:00",
+  "results": [
+    {
+      "server": "A2-AK-225 (root@192.168.9.225:22)",
+      "server_name": "A2-AK-225",
+      "host": "192.168.9.225",
+      "port": 22,
+      "auth_method": "key",
+      "findings": [
+        {
+          "server": "A2-AK-225 (root@192.168.9.225:22)",
+          "location": "host_home",
+          "user": "root",
+          "path": "/root/.codex",
+          "kind": "codex_dir",
+          "severity": "high",
+          "detail": ".codex/ 目录存在 (4 项, auth.json=有(312B))",
+          "meta": { "auth_json_size": 312 }
+        }
+      ]
+    }
+  ],
+  "errors": []
+}
+```
+
+## 配置项
+
+### YAML 字段(servers.yaml)
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `result_dir` | _(空)_ | 扫描完后把工件复制到此目录 |
+| `test_credentials` | `false` | 对每个 key 调 `/v1/models` 测有效性 |
+
+### result_dir 布局
+
+```
+findings/
+├── 192.168.9.225-22/                 # 每台主机一个目录
+│   ├── codex_dir/
+│   │   └── root_.codex/
+│   │       ├── auth.json             # 实际内容(脱敏仅在终端报告里)
+│   │       ├── config.toml
+│   │       └── ...
+│   ├── env_var/
+│   │   └── root_.bashrc_OPENAI_API_KEY_L42.txt   # 含实际值的行
+│   ├── history/
+│   │   └── root_.bash_history.txt
+│   ├── npm_pkg/
+│   │   └── _usr_lib_node_modules_codex_package.json
+│   ├── pip_pkg/...
+│   └── binary/...
+├── URGENT/                           # export *KEY / codex login 单独存
+│   ├── URGENT_root_.bash_history.txt
+│   └── ...
+└── findings.json                     # 全量结构化报告(含 local_path 字段)
+```
+
+所有文件 mode 0600,目录 mode 0700,默认 UMask 下足够安全(防止同机器其他用户读)。
+
+### 命令行参数
+
+| 参数 | 覆盖 YAML | 说明 |
+|------|-----------|------|
+| `--config PATH` | — | YAML 配置文件 |
+| `--result-dir PATH` | `result_dir` | 复制工件到本地 |
+| `--test-credentials` | `test_credentials: true` | 测 key 有效性 |
+| `--jump HOST` | `jump.host` | 跳板机 |
+| `--host H[:P]` | — | 单台覆盖 |
+| `--check` | — | 只测连通性 |
+| `--list-servers` | — | 列出所有 server + 认证摘要 |
+| `--init-to PATH` | — | 生成模板 |
+
+### 环境变量
+
+| 变量 | 覆盖 |
+|------|------|
+| `TEST_PROXY` / `HTTPS_PROXY` / `https_proxy` | `--test-credentials` 走代理(中国用户填 127.0.0.1:7890) |
+| `RESULT_DIR` | `result_dir` |
+| `OUTPUT` | `output` |
+| `PARALLEL` / `CMD_TIMEOUT` / `SCAN_DOCKER` / `SCAN_HISTORY` / `SCAN_NPM_PIP` / `VERBOSE` | `scan.*` |
+
+### servers[] 字段
+
+| 字段 | 必填 | 默认 | 说明 |
+|------|------|------|------|
+| `name` | 否 | `host` | 人类可读的服务器名,出现在报告里 |
+| `host` | 是 | — | IP 或域名 |
+| `port` | 否 | `22` | SSH 端口 |
+| `user` | 否 | `root` | SSH 用户 |
+| `identity_file` | 否 | `~/.ssh` | 公钥路径(支持 `~`),**不存在时跳过 key 阶段** |
+| `bootstrap_password_secret` | 否 | _(空)_ | 首次连接密码(仅在 key 失败时使用) |
+
+### 全局字段
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `jump.host` / `jump.port` / `jump.user` / `jump.identity_file` / `jump.password` | _全空_ | 跳板机配置,启用后所有目标走 ProxyCommand |
+| `scan.parallel` | `4` | 单主机内并行扫描用户的线程数 |
+| `scan.cmd_timeout` | `15` | 单个远程命令超时(秒) |
+| `scan.scan_docker` | `true` | 是否扫描 Docker |
+| `scan.scan_history` | `true` | 是否扫 shell history |
+| `scan.scan_npm_pip` | `true` | 是否扫全局 npm/pip |
+| `scan.verbose` | `false` | 详细日志 |
+| `output` | _(空)_ | JSON 报告路径 |
+
+### 环境变量覆盖
+
+进程环境可覆盖 YAML 中的可调项(优先级: 环境 > YAML > 默认):
+
+- `PARALLEL`、`CMD_TIMEOUT`、`SCAN_DOCKER`、`SCAN_HISTORY`、`SCAN_NPM_PIP`、`VERBOSE`、`OUTPUT`
+
+## 工作原理(单台主机)
+
+1. `getent passwd` 枚举所有带 home 目录的账号
+2. 对每个用户并行执行:
+   - `ls ~/.codex/` 并检测 `auth.json` 大小
+   - `grep` 用户 shell 启动文件中 `OPENAI_API_KEY` / `CODEX_API_KEY` 等
+   - `grep` shell history 中的 `codex` / `openai` / `sk-`
+   - `grep` `~/.npmrc` 中的 `_authToken`
+3. 系统级:`grep` `/etc/environment` / `/etc/profile` / `/etc/profile.d/*`
+4. 全局包:`npm root -g` 查 `codex` / `@openai/codex`,`pip show codex`,`command -v codex`
+5. Docker:
+   - running 容器:`docker exec` 进容器内做与主机相同的子集扫描
+   - stopped 容器:`docker inspect` 列出 volume 挂载点供人工 follow-up
+
+## 常见问题
+
+**Q: 跳板用 key、目标用密码,反之亦然,可以吗?**
+A: 可以。`jump.*` 和每个 `servers[].*` 独立配置,任意组合都行。
+
+**Q: Bootstrap 密码在 key 已部署后忘了删怎么办?**
+A: 强烈建议 `key` 部署完成后把 `bootstrap_password_secret` 那一行删掉,并在远端轮换该密码。脚本会优先用 key,所以保留密码字段本身不会泄露,但多一份明文备份就多一份风险。
+
+**Q: Docker 容器里没有 bash 怎么办?**
+A: 脚本用 `sh -c` 兼容 POSIX,只要容器内有 `sh` 即可,`getent` / `env` 失败时不会中断。
+
+**Q: 跳板机需要密码,需要装 sshpass 吗?**
+A: 跳板机用密码时脚本会自动调用 `sshpass`(未安装则失败,届时 `brew install sshpass`)。目标机密码由 paramiko 直接处理,不依赖 `sshpass`。
+
+**Q: 扫描会不会改远程状态?**
+A: **不会**。所有命令都是只读的(`ls` / `grep` / `test` / `getent` / `env` / `docker inspect` / `docker exec <只读子集>`)。
+
+**Q: `--host` 单机覆盖时,认证怎么走?**
+A: `--host` 创建一个无认证的占位 Server(只设 `host`/`port`,`user=root`),不传 `identity_file` 也不传 `password`,所以会落到第 3 步:用 SSH agent 或 `~/.ssh/` 默认 key。如果目标需要密码,建议在 `servers.yaml` 里配。
+
+**Q: `--test-credentials` 在国内跑会怎么样?**
+A: api.openai.com 在中国被墙,直接跑会全部 `None`(无法判断)。设 `export TEST_PROXY=http://127.0.0.1:7890` 走代理即可。如果代理是 PAC-only 或 socks5,需要转成 HTTP 代理(7890 一般是 HTTP)。
+
+**Q: result_dir 里的文件是脱敏的吗?**
+A: **不是**。这是有意为之——脱敏了你没法 `codex auth login --key=...` 直接用。文件权限 0600 防止同机其他用户读,但你本机一旦被入侵,这些明文 key 就泄露了。处理完后建议手动 `rm -rf findings/` 或整个 `findings/` 加进 `.gitignore`(本项目已加)。
+
+## 开发
+
+```bash
+# 语法检查
+.venv/bin/python -m py_compile codex_finder.py
+
+# 模板生成 + 配置解析验证
+.venv/bin/python codex_finder.py --init-to /tmp/test.yaml
+.venv/bin/python codex_finder.py --config /tmp/test.yaml --list-servers
+```
+
+## 安全备忘
+
+- `servers.yaml` 必须加进 `.gitignore`(本项目模板已加)
+- 不要再把 `bootstrap_password_secret` 或真实密码贴到聊天/工单里
+- 报告里的 `sk-...` 都已脱敏为 `sk-XXXX**XX`,但路径可见,人 review 时请确认
+- `findings/` 目录含明文凭证(权限 0600),用完后请 `rm -rf`,并把它加进全局 `.gitignore`
+- 扫描只在 root 读得动的范围有效,如果 Codex 装在非 root 用户但 home 不可读会漏掉
+
+## 许可
+
+仅供个人盘点使用。扫描他人机器前请确保你有权访问。

@@ -1,0 +1,11 @@
+.env
+servers.yaml
+servers.local.yaml
+findings/
+findings*.json
+findings*.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log

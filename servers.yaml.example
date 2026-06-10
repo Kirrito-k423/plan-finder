@@ -1,0 +1,41 @@
+# ============================================
+# codex_finder — 远端服务器清单
+# 格式兼容 autoresearch 的 servers schema (D-03 Bootstrap-then-Key)
+# ============================================
+# 复制本文件为 servers.yaml 后填实际值, 不填的服务器会被忽略。
+
+servers:
+  - name: server-1
+    host: 192.168.1.10
+    port: 22
+    user: root
+    identity_file: ~/.ssh/id_ed25519
+    # 首次连接一次性密码 (bootstrap 阶段用, 部署完 key 后可删)
+    # bootstrap_password_secret: ""
+
+  # - name: server-2
+  #   host: 192.168.1.11
+  #   port: 22
+  #   user: root
+  #   identity_file: ~/.ssh/id_ed25519
+  #   bootstrap_password_secret: ""
+
+# --- 跳板机 (可选) ---
+jump:
+  host: ""
+  port: 22
+  user: root
+  identity_file: ""
+  password: ""
+
+# --- 扫描行为 ---
+scan:
+  parallel: 16          # 单主机内并行扫描用户的线程数
+  cmd_timeout: 15      # 单个远程命令超时(秒)
+  scan_docker: true    # 是否扫描 Docker
+  scan_history: true   # 是否扫描 shell history
+  scan_npm_pip: true   # 是否扫描全局 npm/pip
+  verbose: false       # 详细日志
+
+# --- JSON 报告路径 (留空不输出) ---
+output: findings.json
