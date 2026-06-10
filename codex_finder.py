@@ -1798,11 +1798,12 @@ class CredentialTester:
             providers or {},
             extra_providers_from_findings or {},
         )
-        self._cred_cache: dict[str, dict[str, bool | None]] = {}
+        # cache: key -> {provider_name -> {valid, status, body_preview, issue, error?}}
+        self._cred_cache: dict[str, dict[str, dict[str, Any]]] = {}
         self._new_discovered: dict[str, str] = {}  # 本次新发现的,save 时写入
 
-    def test(self, finding: Finding) -> tuple[str, dict[str, bool | None]] | None:
-        """返回 (key, {provider_name: valid?}) ,None=抽不到 key 跳过。"""
+    def test(self, finding: Finding) -> tuple[str, dict[str, dict[str, Any]]] | None:
+        """返回 (key, {provider_name: {valid, status, body_preview, issue, error?}})"""
         cred = self._extract(finding)
         if not cred:
             return None
@@ -1810,7 +1811,7 @@ class CredentialTester:
             return cred, self._cred_cache[cred]
         if not self.providers:
             return cred, {}
-        results: dict[str, bool | None] = {}
+        results: dict[str, dict[str, Any]] = {}
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(self.PARALLEL, len(self.providers))
         ) as pool:
@@ -1822,8 +1823,14 @@ class CredentialTester:
                 name = futs[f]
                 try:
                     results[name] = f.result()
-                except Exception:
-                    results[name] = None
+                except Exception as e:
+                    results[name] = {
+                        "valid": None,
+                        "status": None,
+                        "body_preview": "",
+                        "issue": None,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
         self._cred_cache[cred] = results
 
         # 收集本次新发现的 provider(测试过但不在 DEFAULT 也不在已持久化的)
@@ -1857,6 +1864,7 @@ class CredentialTester:
     ) -> str:
         """生成独立可复现的测试脚本(返回脚本内容)。
         source_info 包含 {'server': ..., 'path': ..., 'line': ..., 'key_name': ...}
+        脚本捕获响应体 (body_preview) 并检测 quota/rate_limit/expired 等"假成功"。
         """
         providers_json = json.dumps(
             {n: u for n, u in self.providers.items()},
@@ -1875,10 +1883,21 @@ reproducible credential test
 可以重跑来再次验证(轮换/重新生成 key 后):
     python3 {script_path or "test_" + key_hash + ".py"}
 
-输出:
-  stdout:  JSON {{provider_name: {{status, valid, error?}}}}
-  exit 0:  全部测完(可能有的 None 是网络问题)
-  exit 2:  有 provider 确认失效(401/403)
+输出(stdout): JSON {{
+  results: {{
+    provider_name: {{
+      valid:     True / False / None,
+      status:    200 / 401 / ... / null,
+      body_preview: "<前 300 字符响应体>",
+      issue:     null / "quota_issue" / "rate_limit" / "account_deactivated" / "invalid_in_body"
+    }}
+  }},
+  issues:   ["<provider with issue>", ...],
+  any_valid: bool,  any_invalid: bool
+}}
+exit 0: 全部测完(可能有 None = 网络问题)
+exit 2: 有 provider 确认失效(401/403 或 body 显式 invalid)
+exit 3: 有 provider 200 但 body 有 issue (quota/expired 等,需人工确认)
 """
 from __future__ import annotations
 
@@ -1895,9 +1914,50 @@ PROVIDERS = {providers_json}
 SOURCE_META = {meta_json}
 TIMEOUT = 10
 PROBE_PATH = "/models"
+MAX_BODY = 300
 
-results: dict[str, Any] = {{}}
-for name, base in PROVIDERS.items():
+
+def check_issue(body: str, status: int) -> str | None:
+    """检测 200 但 body 显式 invalid / quota / rate_limit / expired"""
+    if status != 200 or not body:
+        return None
+    bl = body.lower()
+    if '"error"' not in bl and '"code"' not in bl:
+        return None
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        for marker, issue in (
+            ("quota exceeded", "quota_issue"),
+            ("insufficient_quota", "quota_issue"),
+            ("rate limit", "rate_limit"),
+            ("too many requests", "rate_limit"),
+            ("billing", "quota_issue"),
+            ("account has been deactivated", "account_deactivated"),
+            ("account has been deleted", "account_deactivated"),
+            ("expired", "account_expired"),
+        ):
+            if marker in bl:
+                return issue
+        return None
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = str(err.get("code") or err.get("type") or "").lower()
+    message = str(err.get("message") or "").lower()
+    combined = f"{{code}} {{message}}"
+    if any(k in combined for k in ("quota", "insufficient", "billing")):
+        return "quota_issue"
+    if any(k in combined for k in ("rate_limit", "rate limit", "too many")):
+        return "rate_limit"
+    if any(k in combined for k in ("deactivated", "deleted", "expired")):
+        return "account_deactivated"
+    if any(k in combined for k in ("invalid", "incorrect", "unauthorized", "wrong")):
+        return "invalid_in_body"
+    return None
+
+
+def probe(name: str, base: str) -> dict[str, Any]:
     url = base.rstrip("/") + PROBE_PATH
     try:
         if PROXY:
@@ -1910,25 +1970,68 @@ for name, base in PROVIDERS.items():
             url, headers={{"Authorization": f"Bearer {{KEY}}"}}
         )
         with opener.open(req, timeout=TIMEOUT) as resp:
-            results[name] = {{"status": resp.status, "valid": resp.status == 200}}
+            raw = resp.read(2000)
+            body = raw.decode("utf-8", errors="replace") if raw else ""
+            status = resp.status
+            issue = check_issue(body, status)
+            return {{
+                "valid": status == 200 and not issue,
+                "status": status,
+                "body_preview": body[:MAX_BODY].replace(chr(10), " "),
+                "issue": issue,
+            }}
     except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            raw = e.read(2000)
+            body = raw.decode("utf-8", errors="replace") if raw else ""
+        except Exception:
+            pass
         if e.code in (401, 403):
-            results[name] = {{"status": e.code, "valid": False}}
-        else:
-            results[name] = {{"status": e.code, "valid": None}}
+            return {{
+                "valid": False,
+                "status": e.code,
+                "body_preview": body[:MAX_BODY].replace(chr(10), " "),
+                "issue": None,
+            }}
+        return {{
+            "valid": None,
+            "status": e.code,
+            "body_preview": body[:MAX_BODY].replace(chr(10), " "),
+            "issue": None,
+        }}
     except Exception as e:
-        results[name] = {{"error": str(e), "valid": None}}
+        return {{
+            "valid": None,
+            "status": None,
+            "body_preview": "",
+            "issue": None,
+            "error": f"{{type(e).__name__}}: {{e}}",
+        }}
 
+
+results: dict[str, Any] = {{}}
+for name, base in PROVIDERS.items():
+    results[name] = probe(name, base)
+
+issues = [n for n, r in results.items() if r.get("issue")]
 report = {{
     "key_hash": "{key_hash}",
     "source": SOURCE_META,
     "proxy": PROXY,
     "results": results,
+    "issues": issues,
     "any_valid": any(r.get("valid") is True for r in results.values()),
     "any_invalid": any(r.get("valid") is False for r in results.values()),
+    "any_issue": bool(issues),
 }}
 print(json.dumps(report, ensure_ascii=False, indent=2))
-sys.exit(2 if report["any_invalid"] else 0)
+if report["any_invalid"]:
+    sys.exit(2)
+elif report["any_issue"]:
+    sys.exit(3)
+else:
+    sys.exit(0)
 '''
         return script
 
@@ -2022,7 +2125,13 @@ sys.exit(2 if report["any_invalid"] else 0)
             return m.group(1)
         return None
 
-    def _call(self, url: str, api_key: str) -> bool | None:
+    def _call(self, url: str, api_key: str) -> dict[str, Any]:
+        """打一次 {base_url}/models,返回:
+          {valid, status, body_preview, issue, error?}
+        - valid: True=真有效, False=真失效(401/403 或 body 显式 invalid),
+                 None=无法判断(网络/超时/429/5xx/quota 等需人工)
+        - issue: 额外警示,如 quota_issue / rate_limit / account_expired / invalid_in_body
+        """
         import urllib.request
         import urllib.error
 
@@ -2043,14 +2152,91 @@ sys.exit(2 if report["any_invalid"] else 0)
         )
         try:
             with opener.open(req, timeout=self.TIMEOUT) as resp:
-                return resp.status == 200
+                raw = resp.read(2000)
+                body = raw.decode("utf-8", errors="replace") if raw else ""
+                status = resp.status
+                issue = self._check_body_for_issue(body, status)
+                return {
+                    "valid": status == 200 and not issue,
+                    "status": status,
+                    "body_preview": body[:300].replace("\n", " "),
+                    "issue": issue,
+                }
         except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                raw = e.read(2000)
+                body = raw.decode("utf-8", errors="replace") if raw else ""
+            except Exception:
+                pass
             if e.code in (401, 403):
-                return False
-            # 429/5xx/其他 = 无法判断
+                return {
+                    "valid": False,
+                    "status": e.code,
+                    "body_preview": body[:300].replace("\n", " "),
+                    "issue": None,
+                }
+            return {
+                "valid": None,
+                "status": e.code,
+                "body_preview": body[:300].replace("\n", " "),
+                "issue": None,
+            }
+        except Exception as e:
+            return {
+                "valid": None,
+                "status": None,
+                "body_preview": "",
+                "issue": None,
+                "error": str(e),
+            }
+
+    @staticmethod
+    def _check_body_for_issue(body: str, status: int) -> str | None:
+        """从响应体里检测 quota / rate_limit / account_expired 等"假成功"。
+
+        OpenAI 兼容 API 偶尔会 200 + body 内嵌 error(比如某些中转站)
+        """
+        if status != 200 or not body:
             return None
-        except Exception:
+        bl = body.lower()
+
+        # 1) 纯文本 fallback (非 JSON,但有相关关键词直接返回)
+        for marker, issue in (
+            ("quota exceeded", "quota_issue"),
+            ("insufficient_quota", "quota_issue"),
+            ("rate limit", "rate_limit"),
+            ("too many requests", "rate_limit"),
+            ("billing", "quota_issue"),
+            ("account has been deactivated", "account_deactivated"),
+            ("account has been deleted", "account_deactivated"),
+            ("expired", "account_expired"),
+        ):
+            if marker in bl:
+                return issue
+
+        # 2) JSON 结构化检测
+        if '"error"' not in bl and '"code"' not in bl:
             return None
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        err = data.get("error")
+        if not isinstance(err, dict):
+            return None
+        code = str(err.get("code") or err.get("type") or "").lower()
+        message = str(err.get("message") or "").lower()
+        combined = f"{code} {message}"
+        if any(k in combined for k in ("quota", "insufficient", "billing")):
+            return "quota_issue"
+        if any(k in combined for k in ("rate_limit", "rate limit", "too many")):
+            return "rate_limit"
+        if any(k in combined for k in ("deactivated", "deleted", "expired")):
+            return "account_deactivated"
+        if any(k in combined for k in ("invalid", "incorrect", "unauthorized", "wrong")):
+            return "invalid_in_body"
+        return None
 
 
 # ============================================================
@@ -2084,13 +2270,24 @@ class Reporter:
 
     @classmethod
     def _format_valid_mark(cls, v: Any) -> str:
-        """valid 字段可能是 bool/None 或 {provider: bool/None} 矩阵"""
+        """valid 字段可能是 bool/None 或 {provider: {valid, issue, ...}} 矩阵"""
         if isinstance(v, dict) and v:
             parts: list[str] = []
-            for name, r in v.items():
-                if r is True:
+            for name, info in v.items():
+                if isinstance(info, dict):
+                    valid_val = info.get("valid")
+                    issue = info.get("issue")
+                    if valid_val is True and not issue:
+                        parts.append(cls._c(cls.GREEN, f"{name}✓"))
+                    elif valid_val is False:
+                        parts.append(cls._c(cls.RED, f"{name}✗"))
+                    elif issue:
+                        parts.append(cls._c(cls.YELLOW, f"{name}⚠"))
+                    else:
+                        parts.append(cls._c(cls.GRAY, f"{name}?"))
+                elif info is True:
                     parts.append(cls._c(cls.GREEN, f"{name}✓"))
-                elif r is False:
+                elif info is False:
                     parts.append(cls._c(cls.RED, f"{name}✗"))
                 else:
                     parts.append(cls._c(cls.GRAY, f"{name}?"))
@@ -2108,19 +2305,31 @@ class Reporter:
         cls,
         results: list[dict[str, Any]],
         errors: list[dict[str, str]],
+        show_body: bool = False,
     ) -> None:
         total = sum(len(r["findings"]) for r in results)
         by_sev: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "info": 0}
-        # 有效性统计(对 dict-of-provider: 任意 provider True 算"valid"、全 False 算"invalid")
-        valid_cnt = {"valid": 0, "invalid": 0, "untested": 0}
+        # 有效性统计(对 dict-of-provider: 任意 provider True 且无 issue 算"valid")
+        valid_cnt = {"valid": 0, "invalid": 0, "untested": 0, "issue": 0}
         for r in results:
             for f in r["findings"]:
                 by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
                 v = (f.get("meta") or {}).get("valid")
+                has_issue = False
                 if isinstance(v, dict):
-                    if any(x is True for x in v.values()):
+                    values = []
+                    for info in v.values():
+                        if isinstance(info, dict):
+                            values.append(info.get("valid"))
+                            if info.get("issue"):
+                                has_issue = True
+                        else:
+                            values.append(info)
+                    if has_issue:
+                        valid_cnt["issue"] += 1
+                    elif any(x is True for x in values):
                         valid_cnt["valid"] += 1
-                    elif any(x is False for x in v.values()):
+                    elif any(x is False for x in values):
                         valid_cnt["invalid"] += 1
                     else:
                         valid_cnt["untested"] += 1
@@ -2143,12 +2352,17 @@ class Reporter:
             f" / {cls._c(cls.SEV_COLOR['low'], str(by_sev['low']) + ' 低')}"
             f" / {cls._c(cls.SEV_COLOR['info'], str(by_sev['info']) + ' 信息')}"
         )
-        if valid_cnt["valid"] or valid_cnt["invalid"]:
+        if valid_cnt["valid"] or valid_cnt["invalid"] or valid_cnt["issue"]:
             print(
                 f"  有效性: "
-                f"{cls._c(cls.GREEN, '✓' + str(valid_cnt['valid']) + ' 至少一 provider 有效')}"
-                f" / {cls._c(cls.RED, '✗' + str(valid_cnt['invalid']) + ' 至少一 provider 拒绝')}"
-                f" / {cls._c(cls.GRAY, str(valid_cnt['untested']) + ' 未测/无 network')}"
+                f"{cls._c(cls.GREEN, '✓' + str(valid_cnt['valid']) + ' 有效')}"
+                f" / {cls._c(cls.RED, '✗' + str(valid_cnt['invalid']) + ' 失效')}"
+                + (
+                    f" / {cls._c(cls.YELLOW, '⚠' + str(valid_cnt['issue']) + ' 假成功')}"
+                    if valid_cnt["issue"]
+                    else ""
+                )
+                + f" / {cls._c(cls.GRAY, str(valid_cnt['untested']) + ' 未测')}"
             )
         print()
 
@@ -2207,6 +2421,37 @@ class Reporter:
                         "           "
                         + cls._c(cls.CYAN, "↓ " + meta["local_path"])
                     )
+                # 显示 body_preview:有 issue 的总是显示;show_body=True 时全部显示
+                v = meta.get("valid")
+                has_issue_any = False
+                if isinstance(v, dict):
+                    body_lines: list[str] = []
+                    for prov, info in v.items():
+                        if not isinstance(info, dict):
+                            continue
+                        issue = info.get("issue")
+                        body_p = info.get("body_preview", "")
+                        valid_v = info.get("valid")
+                        if issue:
+                            has_issue_any = True
+                            body_lines.append(
+                                f"  ⚠ {prov}  issue={issue}  body: {body_p[:140]}"
+                            )
+                        elif show_body and body_p:
+                            body_lines.append(
+                                f"  · {prov}  status={info.get('status')}  body: {body_p[:140]}"
+                            )
+                    if has_issue_any or show_body:
+                        for bl in body_lines[:6]:
+                            print(
+                                "           "
+                                + cls._c(cls.YELLOW if "⚠" in bl else cls.GRAY, bl)
+                            )
+                        if len(body_lines) > 6:
+                            print(
+                                "           "
+                                + cls._c(cls.GRAY, f"  ...还有 {len(body_lines) - 6} 个")
+                            )
             print()
 
 
@@ -2300,10 +2545,11 @@ def scan_one_server(
                         f"  [URGENT] {urgent_n} 项高优 history 写入 {result_dir}/URGENT/\n"
                     )
 
-            # 3) 测试 key 是否还有效(多 provider)
+            # 3) 测试 key 是否还有效(多 provider,返回含 body_preview + issue 的结构体)
             tested_n = 0
             valid_keys: set[str] = set()
             invalid_keys: set[str] = set()
+            issue_providers: list[str] = []
             tested_credentials_meta: list[dict] = []
             tester: CredentialTester | None = None
             if test_credentials:
@@ -2337,11 +2583,19 @@ def scan_one_server(
                     key_preview = (
                         f.detail.split("=", 1)[-1] if "=" in f.detail else f.detail
                     )
-                    for prov, v in r.items():
-                        if v is True:
+                    for prov, info in r.items():
+                        if not isinstance(info, dict):
+                            continue
+                        valid_val = info.get("valid")
+                        if valid_val is True:
                             valid_keys.add(f"{prov}::{key_preview}")
-                        elif v is False:
+                        elif valid_val is False:
                             invalid_keys.add(f"{prov}::{key_preview}")
+                        issue = info.get("issue")
+                        if issue:
+                            issue_providers.append(
+                                f"{prov}({issue}: {info.get('body_preview','')[:60]})"
+                            )
                     tested_credentials_meta.append({
                         "key_hash": f.meta["key_hash"],
                         "key_preview": key_preview,
@@ -2355,8 +2609,20 @@ def scan_one_server(
                 if tested_n:
                     PROGRESS.write(
                         f"  [validity] {tested_n} 个 key 测过: "
-                        f"✓{len(valid_keys)} 有效, ✗{len(invalid_keys)} 失效\n"
+                        f"✓{len(valid_keys)} 有效, ✗{len(invalid_keys)} 失效"
                     )
+                    if issue_providers:
+                        PROGRESS.write(
+                            f"\n  [issues]   {len(issue_providers)} 个 provider 有异常 "
+                            f"(quota/expired/rate_limit 等,需人工确认)"
+                        )
+                        for ip in issue_providers[:8]:
+                            PROGRESS.write(f"\n    · {ip}")
+                        if len(issue_providers) > 8:
+                            PROGRESS.write(
+                                f"\n    ... 还有 {len(issue_providers) - 8} 个"
+                            )
+                    PROGRESS.write("\n")
                 # 持久化本次新发现的 provider
                 tester.persist_discovered()
 
@@ -2628,7 +2894,7 @@ def cmd_scan(args, app_cfg: AppConfig) -> int:
         if err:
             errors.append(err)
 
-    Reporter.print_summary(results, errors)
+    Reporter.print_summary(results, errors, show_body=args.show_body)
 
     if app_cfg.output:
         try:
@@ -2708,6 +2974,10 @@ def main() -> int:
     ap.add_argument(
         "--start-stopped-containers", action="store_true",
         help="对 stopped 容器尝试 docker start → 扫描 → docker stop(可能触发容器副作用,默认关)",
+    )
+    ap.add_argument(
+        "--show-body", action="store_true",
+        help="把每个 provider 的响应体前 140 字符也打到终端(默认只在 issue 时打)",
     )
     ap.add_argument(
         "--no-color", action="store_true",

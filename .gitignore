@@ -1,4 +1,5 @@
 .env
+auth.json
 servers.yaml
 servers.local.yaml
 findings/
