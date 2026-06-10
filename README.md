@@ -179,6 +179,39 @@ JSON 报告(由 `output: findings.json` 控制):
 }
 ```
 
+## 凭据测试 & 可复现脚本
+
+`--test-credentials`(默认 ON)对每个 key 并行打 DEFAULT + YAML + config.toml + `~/.codex_finder/discovered_providers.json` 里的所有 OpenAI 兼容中转站。
+
+**结果写两处**:
+- `findings/<ts>/<host>/test_results.json` — per-host 结构化
+- `findings/<ts>/<host>/test_scripts/test_<hash>.py` — per-key 独立脚本(mode 0600)
+
+**可复现脚本例子** (`test_3a4f9b2c8d1e.py`):
+
+```bash
+cd findings/20260610-110000/192.168.9.225-22/test_scripts
+TEST_PROXY=http://127.0.0.1:7890 python3 test_3a4f9b2c8d1e.py
+# stdout: {"results": {"openai": {"valid": true}, "zhipu": {"valid": false}, ...}, ...}
+# exit 0: 全部测完(可能含 None = 网络问题)
+# exit 2: 有 provider 确认失效(401/403)
+```
+
+**持续发现新 provider**:
+- 每次跑,`config.toml` 里 `model_providers` 解析出的新 `base_url` 自动加入
+- 跑完写回 `~/.codex_finder/discovered_providers.json`(mode 0600)
+- 下次跑自动加载 + 一起测
+
+**已内置 21 个 provider**:
+openai, deepseek, zhipu, moonshot, dashscope, openrouter, anthropic, gemini, mistral, groq, perplexity, siliconflow, yi, baichuan, stepfun, minimax, **bobdong, tokenshop, yunwu, xcode, taijiai**
+
+要在 YAML 临时加:
+```yaml
+scan:
+  providers:
+    my_proxy: https://my-proxy.example.com/v1
+```
+
 ## 配置项
 
 ### YAML 字段(servers.yaml)
@@ -192,27 +225,31 @@ JSON 报告(由 `output: findings.json` 控制):
 
 ```
 findings/
-├── 192.168.9.225-22/                 # 每台主机一个目录
-│   ├── codex_dir/
-│   │   └── root_.codex/
-│   │       ├── auth.json             # 实际内容(脱敏仅在终端报告里)
-│   │       ├── config.toml
-│   │       └── ...
-│   ├── env_var/
-│   │   └── root_.bashrc_OPENAI_API_KEY_L42.txt   # 含实际值的行
-│   ├── history/
-│   │   └── root_.bash_history.txt
-│   ├── npm_pkg/
-│   │   └── _usr_lib_node_modules_codex_package.json
-│   ├── pip_pkg/...
-│   └── binary/...
-├── URGENT/                           # export *KEY / codex login 单独存
-│   ├── URGENT_root_.bash_history.txt
-│   └── ...
-└── findings.json                     # 全量结构化报告(含 local_path 字段)
+└── 20260610-110000/                    # 每次扫描一个时间戳子目录
+    ├── 192.168.9.225-22/                 # 每台主机一个目录
+    │   ├── codex_dir/
+    │   │   └── root_.codex/              # 递归拷,保留子目录和真实文件名
+    │   │       ├── auth.json
+    │   │       ├── auth (api).json
+    │   │       ├── auth/
+    │   │       │   └── api.json
+    │   │       ├── config.toml
+    │   │       └── _meta.json             # 总结(user/items/providers)
+    │   ├── env_var/
+    │   │   └── root_.bashrc_OPENAI_API_KEY_L42.txt
+    │   ├── history/
+    │   ├── npm_pkg/
+    │   ├── pip_pkg/
+    │   ├── binary/
+    │   ├── test_scripts/                 # 每 key 一个可独立复跑的脚本
+    │   │   ├── test_3a4f9b2c8d1e.py
+    │   │   └── ...
+    │   └── test_results.json              # 完整测试结果 (per-host)
+    ├── URGENT/                           # export *KEY / codex login
+    └── findings.json                     # 全量结构化报告
 ```
 
-所有文件 mode 0600,目录 mode 0700,默认 UMask 下足够安全(防止同机器其他用户读)。
+所有文件 mode 0600,目录 mode 0700。`test_scripts/test_<hash>.py` 是 self-contained 的——轮换/重新生成 key 后可以 `python3 test_<hash>.py` 复跑,不需要再连远程。
 
 ### 命令行参数
 
