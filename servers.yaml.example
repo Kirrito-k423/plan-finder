@@ -35,6 +35,7 @@ scan:
   scan_docker: true    # 是否扫描 Docker
   scan_history: true   # 是否扫描 shell history
   scan_npm_pip: true   # 是否扫描全局 npm/pip
+  scan_extra_homes: true  # 扫描 /home/* 和 /data/* 下不在 passwd 里的 .codex(捕获已删除用户)
   verbose: false       # 详细日志
 
 # --- JSON 报告路径 (留空不输出) ---

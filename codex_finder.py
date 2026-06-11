@@ -441,6 +441,7 @@ class ScanOptions:
     scan_docker: bool = True
     scan_history: bool = True
     scan_npm_pip: bool = True
+    scan_extra_homes: bool = True
     verbose: bool = False
     start_stopped_containers: bool = False
     providers: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -460,6 +461,7 @@ class ScanOptions:
             scan_docker=cfg_bool(d.get("scan_docker"), True),
             scan_history=cfg_bool(d.get("scan_history"), True),
             scan_npm_pip=cfg_bool(d.get("scan_npm_pip"), True),
+            scan_extra_homes=cfg_bool(d.get("scan_extra_homes"), True),
             verbose=cfg_bool(d.get("verbose"), False),
             start_stopped_containers=cfg_bool(d.get("start_stopped_containers"), False),
             providers=providers,
@@ -479,6 +481,8 @@ class ScanOptions:
             self.scan_history = cfg_bool(v, self.scan_history)
         if (v := os.environ.get("SCAN_NPM_PIP")) is not None:
             self.scan_npm_pip = cfg_bool(v, self.scan_npm_pip)
+        if (v := os.environ.get("SCAN_EXTRA_HOMES")) is not None:
+            self.scan_extra_homes = cfg_bool(v, self.scan_extra_homes)
 
 
 @dataclasses.dataclass
@@ -825,6 +829,7 @@ class HostScanner:
         with_docker: bool = True,
         with_history: bool = True,
         with_npm_pip: bool = True,
+        with_extra_homes: bool = True,
         verbose: bool = False,
         start_stopped_containers: bool = False,
     ):
@@ -835,9 +840,9 @@ class HostScanner:
         self.with_docker = with_docker
         self.with_history = with_history
         self.with_npm_pip = with_npm_pip
+        self.with_extra_homes = with_extra_homes
         self.verbose = verbose
         self.start_stopped_containers = start_stopped_containers
-        self.verbose = verbose
 
     def log(self, msg: str) -> None:
         if self.verbose:
@@ -864,11 +869,45 @@ class HostScanner:
             users.append((u, h))
         return users
 
+    def _list_extra_homes(self, known_homes: set[str]) -> list[tuple[str, str]]:
+        """扫描 /home/* 和 /data/* 下有 .codex 目录但不在 passwd 里的用户。
+        用于捕获已删除用户遗留的凭证(如 cdj-bak)。"""
+        if not self.with_extra_homes:
+            return []
+        # 找所有 /home/*/.codex 和 /data/*/.codex (含子目录 .codex)
+        cmd = (
+            "for d in /home/*/.codex /data/*/.codex; do "
+            "  [ -d \"$d\" ] && echo \"$(dirname \"$d\"):$d\"; "
+            "done 2>/dev/null"
+        )
+        out, _, _ = self.ex.run(cmd, timeout=10)
+        extra: list[tuple[str, str]] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            home, codex = line.split(":", 1)
+            # 跳过已被 passwd 覆盖的
+            if home.rstrip("/") in known_homes:
+                continue
+            # 用目录名作为 user 标识
+            user = Path(home).name
+            extra.append((f"(extra:{user})", home))
+        return extra
+
     # ---------- 顶层 ----------
 
     def scan_all(self) -> list[Finding]:
         findings: list[Finding] = []
         users = self.list_users()
+        # 额外扫描 /home/* 和 /data/* 下不在 passwd 里的 .codex 目录
+        known_homes = {h.rstrip("/") for _, h in users}
+        extra = self._list_extra_homes(known_homes)
+        if extra:
+            self._progress(
+                f"[额外目录] 发现 {len(extra)} 个已删除用户的 .codex 目录"
+            )
+            users = users + extra
         total = len(users)
         self._progress(
             f"[用户] 发现 {total} 个账号 (并行度 {self.parallel})"
@@ -1018,21 +1057,28 @@ class HostScanner:
         if "auth.json" in top_items and "auth.json" not in candidate_jsons:
             candidate_jsons.insert(0, "auth.json")
 
-        # 取每个 JSON 的大小
+        # 取每个 JSON 的大小(批量执行避免并发 SSH 通道问题)
         auth_files_meta: list[dict[str, Any]] = []
-        for rel in candidate_jsons:
-            p = f"{codex_dir}/{rel}"
-            sz_out, _, _ = self.ex.run(
-                f"test -f {self._shell_quote(p)} "
-                f"&& wc -c < {self._shell_quote(p)} || echo 0",
-                timeout=5,
+        if candidate_jsons:
+            # 一次 remote 命令拿到所有候选文件的大小
+            size_cmds = " ; ".join(
+                f"test -f {self._shell_quote(f'{codex_dir}/{rel}')} "
+                f"&& echo '{rel}:'$(wc -c < {self._shell_quote(f'{codex_dir}/{rel}')}) "
+                f"|| echo '{rel}:0'"
+                for rel in candidate_jsons
             )
-            try:
-                sz = int(sz_out.strip().split()[0])
-            except (ValueError, IndexError):
-                sz = 0
-            if sz > 0:
-                auth_files_meta.append({"path": rel, "size": sz})
+            sz_out, _, _ = self.ex.run(size_cmds, timeout=10)
+            for line in sz_out.splitlines():
+                line = line.strip()
+                if ":" not in line:
+                    continue
+                rel, _, sz_str = line.partition(":")
+                try:
+                    sz = int(sz_str.strip())
+                except ValueError:
+                    sz = 0
+                if sz > 0:
+                    auth_files_meta.append({"path": rel.strip(), "size": sz})
 
         # 读 config.toml 全文(用于 model_providers 解析)
         cfg_path = f"{codex_dir}/config.toml"
@@ -1611,15 +1657,28 @@ class ResultFetcher:
             self._safe_name(f"{user}_{Path(codex_dir).name}")
         )
         out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # 递归列所有文件(包含 auth/ 子目录,真实文件名)
-        find_out, _, _ = self.ex.run(
+        # 先拿 auth 相关文件(优先级高),再拿其余文件(限制 100)
+        auth_find, _, _ = self.ex.run(
+            f"find {shlex.quote(codex_dir)} -type f "
+            f"\\( -name 'auth*' -o -name 'auto.json' -o -name 'config.toml' "
+            f"-o -name '_meta.json' \\) 2>/dev/null",
+            timeout=10,
+        )
+        other_find, _, _ = self.ex.run(
             f"find {shlex.quote(codex_dir)} -type f 2>/dev/null | head -100",
             timeout=10,
         )
-        remotes = [
-            ln.strip() for ln in find_out.splitlines()
+        # 合并:auth 优先,去重
+        auth_set = {
+            ln.strip() for ln in auth_find.splitlines()
             if ln.strip() and not ln.strip().endswith("/.")
-        ]
+        }
+        all_files = list(auth_set)
+        for ln in other_find.splitlines():
+            ln = ln.strip()
+            if ln and ln not in auth_set and not ln.endswith("/."):
+                all_files.append(ln)
+        remotes = all_files
         prefix = codex_dir.rstrip("/") + "/"
         for remote in remotes:
             if not remote.startswith(prefix):
@@ -1863,41 +1922,31 @@ class CredentialTester:
         script_path: Path | None = None,
     ) -> str:
         """生成独立可复现的测试脚本(返回脚本内容)。
-        source_info 包含 {'server': ..., 'path': ..., 'line': ..., 'key_name': ...}
-        脚本捕获响应体 (body_preview) 并检测 quota/rate_limit/expired 等"假成功"。
+        支持两种模式:
+          python3 test_<hash>.py                 → 验证 key 有效性(默认)
+          python3 test_<hash>.py --chat "问题"    → 单次对话
+          python3 test_<hash>.py --chat           → 交互式对话
         """
         providers_json = json.dumps(
             {n: u for n, u in self.providers.items()},
             ensure_ascii=False, indent=2,
         )
-        # 用 hash 避免 filename 泄露 key
         key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
         meta_json = json.dumps(source_info or {}, ensure_ascii=False, indent=2)
+        default_name = script_path or f"test_{key_hash}.py"
         script = f'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-reproducible credential test
-  key_hash: {key_hash}
-  source : {source_info or "(unknown)"}
+codex_finder 生成的凭证脚本  key_hash={key_hash}
+  source: {source_info or "(unknown)"}
 
-可以重跑来再次验证(轮换/重新生成 key 后):
-    python3 {script_path or "test_" + key_hash + ".py"}
+用法:
+  python3 {default_name}                  # 验证 key 有效性
+  python3 {default_name} --chat "你的问题"  # 单次对话
+  python3 {default_name} --chat            # 交互式对话(多轮)
 
-输出(stdout): JSON {{
-  results: {{
-    provider_name: {{
-      valid:     True / False / None,
-      status:    200 / 401 / ... / null,
-      body_preview: "<前 300 字符响应体>",
-      issue:     null / "quota_issue" / "rate_limit" / "account_deactivated" / "invalid_in_body"
-    }}
-  }},
-  issues:   ["<provider with issue>", ...],
-  any_valid: bool,  any_invalid: bool
-}}
-exit 0: 全部测完(可能有 None = 网络问题)
-exit 2: 有 provider 确认失效(401/403 或 body 显式 invalid)
-exit 3: 有 provider 200 但 body 有 issue (quota/expired 等,需人工确认)
+环境变量:
+  TEST_PROXY / HTTPS_PROXY  代理地址(如 http://127.0.0.1:7890)
 """
 from __future__ import annotations
 
@@ -1912,13 +1961,21 @@ KEY = {key!r}
 PROXY = os.environ.get("TEST_PROXY") or os.environ.get("HTTPS_PROXY")
 PROVIDERS = {providers_json}
 SOURCE_META = {meta_json}
-TIMEOUT = 10
+TIMEOUT = 30
 PROBE_PATH = "/models"
+CHAT_PATH = "/chat/completions"
 MAX_BODY = 300
 
+# ── 工具函数 ──────────────────────────────────────────────
+
+def _opener():
+    if PROXY:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({{"https": PROXY, "http": PROXY}})
+        )
+    return urllib.request.build_opener()
 
 def check_issue(body: str, status: int) -> str | None:
-    """检测 200 但 body 显式 invalid / quota / rate_limit / expired"""
     if status != 200 or not body:
         return None
     bl = body.lower()
@@ -1956,20 +2013,15 @@ def check_issue(body: str, status: int) -> str | None:
         return "invalid_in_body"
     return None
 
+# ── 验证模式 ──────────────────────────────────────────────
 
 def probe(name: str, base: str) -> dict[str, Any]:
     url = base.rstrip("/") + PROBE_PATH
     try:
-        if PROXY:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({{"https": PROXY, "http": PROXY}})
-            )
-        else:
-            opener = urllib.request.build_opener()
         req = urllib.request.Request(
             url, headers={{"Authorization": f"Bearer {{KEY}}"}}
         )
-        with opener.open(req, timeout=TIMEOUT) as resp:
+        with _opener().open(req, timeout=TIMEOUT) as resp:
             raw = resp.read(2000)
             body = raw.decode("utf-8", errors="replace") if raw else ""
             status = resp.status
@@ -1988,50 +2040,156 @@ def probe(name: str, base: str) -> dict[str, Any]:
         except Exception:
             pass
         if e.code in (401, 403):
-            return {{
-                "valid": False,
-                "status": e.code,
-                "body_preview": body[:MAX_BODY].replace(chr(10), " "),
-                "issue": None,
-            }}
-        return {{
-            "valid": None,
-            "status": e.code,
-            "body_preview": body[:MAX_BODY].replace(chr(10), " "),
-            "issue": None,
-        }}
+            return {{"valid": False, "status": e.code,
+                     "body_preview": body[:MAX_BODY].replace(chr(10), " "), "issue": None}}
+        return {{"valid": None, "status": e.code,
+                 "body_preview": body[:MAX_BODY].replace(chr(10), " "), "issue": None}}
     except Exception as e:
-        return {{
-            "valid": None,
-            "status": None,
-            "body_preview": "",
-            "issue": None,
-            "error": f"{{type(e).__name__}}: {{e}}",
-        }}
+        return {{"valid": None, "status": None, "body_preview": "",
+                 "issue": None, "error": f"{{type(e).__name__}}: {{e}}"}}
 
 
-results: dict[str, Any] = {{}}
-for name, base in PROVIDERS.items():
-    results[name] = probe(name, base)
+def cmd_check():
+    results: dict[str, Any] = {{}}
+    for name, base in PROVIDERS.items():
+        results[name] = probe(name, base)
+    issues = [n for n, r in results.items() if r.get("issue")]
+    report = {{
+        "key_hash": "{key_hash}",
+        "source": SOURCE_META,
+        "proxy": PROXY,
+        "results": results,
+        "issues": issues,
+        "any_valid": any(r.get("valid") is True for r in results.values()),
+        "any_invalid": any(r.get("valid") is False for r in results.values()),
+        "any_issue": bool(issues),
+    }}
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["any_invalid"]:
+        sys.exit(2)
+    elif report["any_issue"]:
+        sys.exit(3)
+    else:
+        sys.exit(0)
 
-issues = [n for n, r in results.items() if r.get("issue")]
-report = {{
-    "key_hash": "{key_hash}",
-    "source": SOURCE_META,
-    "proxy": PROXY,
-    "results": results,
-    "issues": issues,
-    "any_valid": any(r.get("valid") is True for r in results.values()),
-    "any_invalid": any(r.get("valid") is False for r in results.values()),
-    "any_issue": bool(issues),
-}}
-print(json.dumps(report, ensure_ascii=False, indent=2))
-if report["any_invalid"]:
-    sys.exit(2)
-elif report["any_issue"]:
-    sys.exit(3)
-else:
-    sys.exit(0)
+# ── Chat 模式 ──────────────────────────────────────────────
+
+def _find_best_provider() -> tuple[str, str] | None:
+    """找一个 valid 的 provider(优先 status=200 的)。"""
+    best: tuple[str, str] | None = None
+    for name, base in PROVIDERS.items():
+        r = probe(name, base)
+        if r.get("valid"):
+            if best is None:
+                best = (name, base)
+    return best
+
+
+def chat_completion(base_url: str, question: str, model: str = "") -> str:
+    """发送 chat 请求,返回助手回复文本。"""
+    url = base_url.rstrip("/") + CHAT_PATH
+    # 如果没指定 model,尝试从 /models 列表里选第一个
+    if not model:
+        try:
+            req = urllib.request.Request(
+                base_url.rstrip("/") + "/models",
+                headers={{"Authorization": f"Bearer {{KEY}}"}}
+            )
+            with _opener().open(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                models = data.get("data") or []
+                # 优先选 gpt-4o / gpt-5 / claude / deepseek
+                preferred = ["gpt-5", "gpt-4o", "claude", "deepseek", "qwen"]
+                for pref in preferred:
+                    for m in models:
+                        mid = m.get("id", "")
+                        if pref in mid.lower():
+                            model = mid
+                            break
+                    if model:
+                        break
+                if not model and models:
+                    model = models[0].get("id", "gpt-3.5-turbo")
+                elif not model:
+                    model = "gpt-3.5-turbo"
+        except Exception:
+            model = "gpt-3.5-turbo"
+
+    payload = json.dumps({{
+        "model": model,
+        "messages": [{{"role": "user", "content": question}}],
+        "temperature": 0.7,
+    }}).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={{
+            "Authorization": f"Bearer {{KEY}}",
+            "Content-Type": "application/json",
+        }},
+        method="POST",
+    )
+    with _opener().open(req, timeout=TIMEOUT) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        choices = data.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or choices[0].get("delta") or {{}}
+            return msg.get("content", "")
+        return f"(无 choices, 原始响应: {{raw[:500]}})"
+
+
+def cmd_chat(question: str | None):
+    print(f"[*] 查找可用 provider ...", file=sys.stderr)
+    best = _find_best_provider()
+    if not best:
+        print("[!] 所有 provider 均不可用,请先运行 --check 模式诊断", file=sys.stderr)
+        sys.exit(1)
+    prov_name, prov_base = best
+    print(f"[*] 使用 provider: {{prov_name}} ({{prov_base}})", file=sys.stderr)
+
+    if question:
+        # 单次对话
+        try:
+            reply = chat_completion(prov_base, question)
+            print(reply)
+        except Exception as e:
+            print(f"[!] 请求失败: {{e}}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # 交互式对话
+        print(f"[*] 交互模式(输入 quit/exit 退出, Ctrl+C 中断)\\n", file=sys.stderr)
+        while True:
+            try:
+                q = input("You> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\\n[*] 再见")
+                break
+            if not q or q.lower() in ("quit", "exit", "q"):
+                print("[*] 再见")
+                break
+            try:
+                reply = chat_completion(prov_base, q)
+                print(f"\\nAssistant> {{reply}}\\n")
+            except Exception as e:
+                print(f"[!] 请求失败: {{e}}", file=sys.stderr)
+
+
+# ── main ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] == "--check":
+        cmd_check()
+    elif args[0] == "--chat":
+        q = args[1] if len(args) > 1 else None
+        cmd_chat(q)
+    elif args[0] in ("-h", "--help"):
+        print(__doc__)
+    else:
+        print(f"未知参数: {{args[0]}}\\n用法: python3 {default_name} [--check|--chat '问题']")
+        sys.exit(1)
 '''
         return script
 
@@ -2501,6 +2659,7 @@ def scan_one_server(
                 with_docker=opts.scan_docker,
                 with_history=opts.scan_history,
                 with_npm_pip=opts.scan_npm_pip,
+                with_extra_homes=opts.scan_extra_homes,
                 verbose=opts.verbose,
                 start_stopped_containers=opts.start_stopped_containers,
             )
@@ -2515,6 +2674,19 @@ def scan_one_server(
             PROGRESS.write(
                 f"  ✓ 连接成功 [auth={executor._auth_method}]  "
                 f"uname: {out.strip()[:100]}\n"
+            )
+            # 打印扫描策略
+            flags = []
+            if opts.scan_docker:
+                flags.append("docker")
+            if opts.scan_history:
+                flags.append("history")
+            if opts.scan_npm_pip:
+                flags.append("npm/pip")
+            if opts.scan_extra_homes:
+                flags.append("extra_homes(/home/*,/data/*)")
+            PROGRESS.write(
+                f"  [策略] 扫描项: {', '.join(flags) if flags else '(仅 codex_dir + env)'}\n"
             )
             findings = scanner.scan_all()
 
@@ -2676,8 +2848,10 @@ def scan_one_server(
                 )
                 os.chmod(test_results_path, 0o600)
                 PROGRESS.write(
-                    f"  [test_scripts] {scripts_written} 个 key → {test_scripts_dir}/  "
-                    f"(`python3 test_<hash>.py` 可复跑)\n"
+                    f"  [test_scripts] {scripts_written} 个 key → {test_scripts_dir}/\n"
+                    f"    验证: python3 test_<hash>.py\n"
+                    f"    对话: python3 test_<hash>.py --chat '你好'\n"
+                    f"    交互: python3 test_<hash>.py --chat\n"
                 )
                 PROGRESS.write(
                     f"  [test_results] {test_results_path}\n"
