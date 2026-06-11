@@ -2685,88 +2685,95 @@ def scan_one_server(
 
                 # 5) access_plan.json: 真实可用的 (key × provider) 组合
                 # 用途:用户用哪个 key 调哪个 endpoint,一眼能看;清理时知道哪个 key 完全没用
-                access_dir = Path(result_dir) / safe_server / "access_plan"
-                access_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                # 5a) per-host summary: 所有 (key, provider) 有效组合
-                access_summary = {
-                    "server": server.short_label,
-                    "generated": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "providers_count": len(tester.providers),
-                    "total_combinations_tested": (
-                        sum(
-                            len(tester.providers)
-                            for _ in tested_credentials_meta
-                        )
-                    ),
-                    "valid_combinations_count": 0,
-                    "combinations": [],
-                }
-                # 5b) per-key 详情:每个 key 的 access_plan
-                per_key_access: dict[str, dict] = {}
-                for m in tested_credentials_meta:
-                    key_hash = m["key_hash"]
-                    for prov_name, info in m["results"].items():
-                        if not isinstance(info, dict):
-                            continue
-                        valid_v = info.get("valid")
-                        # 记录所有"真有效"(valid=True 且无 issue)的组合
-                        if valid_v is True and not info.get("issue"):
-                            combo = {
-                                "key_hash": key_hash,
-                                "key_preview": m["key_preview"],
-                                "key_source_server": m["source_server"],
-                                "key_source_path": m["key_source_path"],
-                                "key_source_kind": m["key_source_kind"],
-                                "key_source_user": m["key_source_user"],
-                                "provider": prov_name,
-                                "provider_url": tester.providers.get(prov_name, ""),
-                                "status": info.get("status"),
-                                "body_preview": info.get("body_preview", ""),
-                            }
-                            access_summary["combinations"].append(combo)
-                            access_summary["valid_combinations_count"] += 1
-                            # 累积到 per-key
-                            if key_hash not in per_key_access:
-                                per_key_access[key_hash] = {
+                # 用 try/except 包裹,任何字段错误都不应阻塞整个 scan
+                try:
+                    access_dir = Path(result_dir) / safe_server / "access_plan"
+                    access_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    # 5a) per-host summary: 所有 (key, provider) 有效组合
+                    access_summary = {
+                        "server": server.short_label,
+                        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "providers_count": len(tester.providers),
+                        "total_combinations_tested": (
+                            sum(
+                                len(tester.providers)
+                                for _ in tested_credentials_meta
+                            )
+                        ),
+                        "valid_combinations_count": 0,
+                        "combinations": [],
+                    }
+                    # 5b) per-key 详情:每个 key 的 access_plan
+                    per_key_access: dict[str, dict] = {}
+                    for m in tested_credentials_meta:
+                        key_hash = m["key_hash"]
+                        for prov_name, info in m["results"].items():
+                            if not isinstance(info, dict):
+                                continue
+                            valid_v = info.get("valid")
+                            # 记录所有"真有效"(valid=True 且无 issue)的组合
+                            if valid_v is True and not info.get("issue"):
+                                combo = {
                                     "key_hash": key_hash,
                                     "key_preview": m["key_preview"],
                                     "key_source_server": m["source_server"],
-                                    "key_source_path": m["key_source_path"],
-                                    "key_source_kind": m["key_source_kind"],
-                                    "key_source_user": m["key_source_user"],
-                                    "test_script": f"test_scripts/test_{key_hash}.py",
-                                    "providers": {},
+                                    "key_source_path": m["source_path"],
+                                    "key_source_kind": m["source_kind"],
+                                    "key_source_user": m["source_user"],
+                                    "provider": prov_name,
+                                    "provider_url": tester.providers.get(prov_name, ""),
+                                    "status": info.get("status"),
+                                    "body_preview": info.get("body_preview", ""),
                                 }
-                            per_key_access[key_hash]["providers"][prov_name] = {
-                                "url": tester.providers.get(prov_name, ""),
-                                "status": info.get("status"),
-                                "body_preview": info.get("body_preview", ""),
-                            }
-                # 写 per-host summary
-                access_summary_path = (
-                    Path(result_dir) / safe_server / "access_plan.json"
-                )
-                access_summary_path.write_text(
-                    json.dumps(access_summary, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                os.chmod(access_summary_path, 0o600)
-                # 写 per-key
-                for key_hash, plan in per_key_access.items():
-                    plan_path = access_dir / f"access_plan_{key_hash}.json"
-                    plan_path.write_text(
-                        json.dumps(plan, ensure_ascii=False, indent=2),
+                                access_summary["combinations"].append(combo)
+                                access_summary["valid_combinations_count"] += 1
+                                # 累积到 per-key
+                                if key_hash not in per_key_access:
+                                    per_key_access[key_hash] = {
+                                        "key_hash": key_hash,
+                                        "key_preview": m["key_preview"],
+                                        "key_source_server": m["source_server"],
+                                        "key_source_path": m["source_path"],
+                                        "key_source_kind": m["source_kind"],
+                                        "key_source_user": m["source_user"],
+                                        "test_script": f"test_scripts/test_{key_hash}.py",
+                                        "providers": {},
+                                    }
+                                per_key_access[key_hash]["providers"][prov_name] = {
+                                    "url": tester.providers.get(prov_name, ""),
+                                    "status": info.get("status"),
+                                    "body_preview": info.get("body_preview", ""),
+                                }
+                    # 写 per-host summary
+                    access_summary_path = (
+                        Path(result_dir) / safe_server / "access_plan.json"
+                    )
+                    access_summary_path.write_text(
+                        json.dumps(access_summary, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                    os.chmod(plan_path, 0o600)
-                PROGRESS.write(
-                    f"  [access_plan] {access_summary['valid_combinations_count']} 个有效 (key×provider) 组合 → "
-                    f"{access_summary_path}\n"
-                )
-                if per_key_access:
+                    os.chmod(access_summary_path, 0o600)
+                    # 写 per-key
+                    for key_hash, plan in per_key_access.items():
+                        plan_path = access_dir / f"access_plan_{key_hash}.json"
+                        plan_path.write_text(
+                            json.dumps(plan, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        os.chmod(plan_path, 0o600)
                     PROGRESS.write(
-                        f"  [access_plan/per-key] {len(per_key_access)} 个 key 的 access_plan 详情 → "
-                        f"{access_dir}/\n"
+                        f"  [access_plan] {access_summary['valid_combinations_count']} 个有效 (key×provider) 组合 → "
+                        f"{access_summary_path}\n"
+                    )
+                    if per_key_access:
+                        PROGRESS.write(
+                            f"  [access_plan/per-key] {len(per_key_access)} 个 key 的 access_plan 详情 → "
+                            f"{access_dir}/\n"
+                        )
+                except Exception as _ap_err:
+                    PROGRESS.write(
+                        f"  [access_plan] ⚠ 写入失败: {type(_ap_err).__name__}: {_ap_err}\n"
+                        f"    扫描结果已保存,不影响其它 host;请报告此 bug\n"
                     )
 
             if fetcher is not None:
