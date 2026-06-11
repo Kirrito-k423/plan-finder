@@ -12,6 +12,9 @@
 - **报告层**: 去重 / URGENT 标记 / time-stamped result_dir (mode 0600/0700)
 - **测试层**: 21+ 个 OpenAI 兼容中转站 (DEFAULT_PROVIDERS + 用户 YAML + ~/.codex/config.toml + 持久化 discovered_providers.json) 并行测,返回 {provider: True/False/None} 矩阵
 - **可复现层**: 每 key 一个 `test_scripts/test_<hash>.py` self-contained 脚本 + `test_results.json` 报告
+- **access_plan 层**: `access_plan.json` (per-host 汇总) + `access_plan/access_plan_<key_hash>.json` (per-key 详情) 记录真实可用的 (key × provider) 组合,含 body_preview
+- **响应体捕获**: `_call` 返 `{valid, status, body_preview, issue}`,`_check_body_for_issue` 扫 quota/expired/rate_limit 等假成功
+- **失败模式**: body 200 + `{"error":{"code":"insufficient_quota"}}` 标 `⚠` 而不是 `✓`
 
 **Status**:✅ 已实现 + 推到 https://github.com/Kirrito-k423/plan-finder
 

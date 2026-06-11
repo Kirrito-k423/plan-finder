@@ -183,9 +183,12 @@ JSON 报告(由 `output: findings.json` 控制):
 
 `--test-credentials`(默认 ON)对每个 key 并行打 DEFAULT + YAML + config.toml + `~/.codex_finder/discovered_providers.json` 里的所有 OpenAI 兼容中转站。
 
-**结果写两处**:
-- `findings/<ts>/<host>/test_results.json` — per-host 结构化
+**响应体默认打**:body 前 140 字符(无论 200/401/issue)都打,方便肉眼判断是不是 quota 假成功。用 `--no-show-body` 关闭。
+
+**结果写三处**:
+- `findings/<ts>/<host>/test_results.json` — per-host 完整测试结果(含 body_preview + issue)
 - `findings/<ts>/<host>/test_scripts/test_<hash>.py` — per-key 独立脚本(mode 0600)
+- `findings/<ts>/<host>/access_plan.json` + `access_plan/access_plan_<key_hash>.json` — **真实可用**的 (key × provider) 组合
 
 **可复现脚本例子** (`test_3a4f9b2c8d1e.py`):
 
@@ -195,7 +198,56 @@ TEST_PROXY=http://127.0.0.1:7890 python3 test_3a4f9b2c8d1e.py
 # stdout: {"results": {"openai": {"valid": true}, "zhipu": {"valid": false}, ...}, ...}
 # exit 0: 全部测完(可能含 None = 网络问题)
 # exit 2: 有 provider 确认失效(401/403)
+# exit 3: 有 provider 200 但 body 有 issue (quota/expired)
 ```
+
+**access_plan.json — 真实可用的 (key × provider) 组合**:
+
+每个 host 生成:
+- `access_plan.json` — 该 host 所有"真有效"组合(200 + body 无 issue)的汇总
+- `access_plan/access_plan_<key_hash>.json` — per-key 详情,含可复跑 test_script 路径
+
+```jsonc
+// access_plan.json (per-host)
+{
+  "server": "A3-AK-182 (root@192.168.13.182:22)",
+  "providers_count": 22,
+  "valid_combinations_count": 3,
+  "combinations": [
+    {
+      "key_hash": "7450481bef1a",
+      "key_preview": "sk-1T***8z",
+      "key_source_server": "A3-AK-182 (...)",
+      "key_source_path": "/home/operator/.codex",
+      "key_source_kind": "codex_dir",
+      "key_source_user": "operator",
+      "provider": "openai",
+      "provider_url": "https://api.openai.com/v1",
+      "status": 200,
+      "body_preview": "{\"object\":\"list\",\"data\":[...]}",
+    },
+    // ...
+  ],
+}
+```
+
+```jsonc
+// access_plan/access_plan_7450481bef1a.json (per-key)
+{
+  "key_hash": "7450481bef1a",
+  "key_preview": "sk-1T***8z",
+  "test_script": "test_scripts/test_7450481bef1a.py",
+  "providers": {
+    "openai": { "url": "...", "status": 200, "body_preview": "..." },
+    "yunwu":  { "url": "...", "status": 200, "body_preview": "..." }
+  }
+}
+```
+
+用途:
+- **路由决策**: 多个 key 多个 provider,这张表告诉你哪个 key 调哪个 endpoint
+- **清理死 key**: `providers` 为空 → 这 key 在所有测过的 provider 上都失效了,去 OpenAI 控制台 revoke
+- **轮换验证**: revoke 之后 `python3 test_<hash>.py` 复跑,access_plan 里的 `status` 应变 401
 
 **持续发现新 provider**:
 - 每次跑,`config.toml` 里 `model_providers` 解析出的新 `base_url` 自动加入
@@ -244,7 +296,11 @@ findings/
     │   ├── test_scripts/                 # 每 key 一个可独立复跑的脚本
     │   │   ├── test_3a4f9b2c8d1e.py
     │   │   └── ...
-    │   └── test_results.json              # 完整测试结果 (per-host)
+    │   ├── test_results.json              # 完整测试结果 (per-host,含 body+issue)
+    │   ├── access_plan.json               # 真实可用 (key×provider) 组合汇总 (per-host)
+    │   └── access_plan/                  # per-key access_plan 详情
+    │       ├── access_plan_3a4f9b2c8d1e.json
+    │       └── ...
     ├── URGENT/                           # export *KEY / codex login
     └── findings.json                     # 全量结构化报告
 ```
@@ -257,7 +313,10 @@ findings/
 |------|-----------|------|
 | `--config PATH` | — | YAML 配置文件 |
 | `--result-dir PATH` | `result_dir` | 复制工件到本地 |
-| `--test-credentials` | `test_credentials: true` | 测 key 有效性 |
+| `--test-credentials` | `test_credentials: true` | 测 key 有效性(默认 ON) |
+| `--no-test-credentials` | `test_credentials: false` | 关闭测 key |
+| `--no-show-body` | — | 不打印每个 provider 响应体(默认打) |
+| `--start-stopped-containers` | `scan.start_stopped_containers` | 启动 stopped 容器再扫 |
 | `--jump HOST` | `jump.host` | 跳板机 |
 | `--host H[:P]` | — | 单台覆盖 |
 | `--check` | — | 只测连通性 |
