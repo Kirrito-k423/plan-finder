@@ -413,6 +413,72 @@ A: **不是**。这是有意为之——脱敏了你没法 `codex auth login --k
 .venv/bin/python codex_finder.py --config /tmp/test.yaml --list-servers
 ```
 
+## 单点 OpenAI 凭证测试 (`test_openai_auth.py`)
+
+`findings/.../codex_dir/operator_.codex/auth (api).json` 扫出来之后,通常还想当场验证“这份 token 还能不能调通 OpenAI”。`test_openai_auth.py` 是一个独立脚本,只依赖 Python 3.8+ 标准库,默认读取 `auth.json` 并对 `https://api.openai.com/v1/responses` 发一个最小请求。
+
+### 用法
+
+```bash
+# 1) 直接用 OPENAI_API_KEY 测
+.venv/bin/python test_openai_auth.py --auth auth.json --auth-type api-key
+
+# 2) 用 ChatGPT 登录态 (tokens.access_token) 测
+TEST_PROXY=http://127.0.0.1:7890 .venv/bin/python test_openai_auth.py \
+  --auth auth.json --auth-type chatgpt --show-token-info
+
+# 3) 先用 refresh_token 换新 access_token 再测
+TEST_PROXY=http://127.0.0.1:7890 .venv/bin/python test_openai_auth.py \
+  --auth auth.json --auth-type chatgpt --refresh --show-token-info
+
+# 4) 刷新成功并把新 token 原子写回 auth.json
+TEST_PROXY=http://127.0.0.1:7890 .venv/bin/python test_openai_auth.py \
+  --auth auth.json --auth-type chatgpt --refresh --write-back
+
+# 5) 纯本地解码 JWT,不发任何请求(看 exp/aud/scp/email/organizations)
+.venv/bin/python test_openai_auth.py --auth auth.json --decode-token all
+```
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--auth PATH` | `auth.json` | auth.json 路径 |
+| `--auth-type {auto,api-key,chatgpt}` | `auto` | 凭证来源。`chatgpt` 用 `tokens.access_token` |
+| `--model MODEL` | `gpt-4o-mini` | 调用模型 |
+| `--prompt PROMPT` | `Reply with exactly: ok` | 测试 prompt |
+| `--proxy PROXY` / `TEST_PROXY` | _空_ | 走 HTTP(S) 代理,国内用 `http://127.0.0.1:7890` |
+| `--timeout N` | `30` | 请求超时秒 |
+| `--raw` | _关_ | 打印完整 JSON 响应而不是文本 |
+| `--refresh` | _关_ | 用 `tokens.refresh_token` 换新 access_token 后再测 |
+| `--refresh-scope S` | `openid profile email offline_access api.responses.write` | OAuth 刷新时请求的 scope(注: 实际能否下发取决于账号当初登录时是否同意) |
+| `--write-back` | _关_ | 与 `--refresh` 配合,原子写回 `auth.json` (tmp + rename, mode 0600) |
+| `--show-token-info` | _关_ | 在 stderr 打印 `exp / aud / scp` |
+| `--check-scopes` | _关_ | 只解码 JWT 输出 scopes,不发请求 |
+| `--decode-token {access,id,refresh,all}` | _空_ | 纯本地解码 JWT,输出 `time_claims / identity / openai / scopes`,不调任何网络 |
+| `--no-account-id` | _关_ | 不发 `chatgpt-account-id` 头(默认会用 `tokens.account_id`) |
+
+### 401 / scope 错误诊断
+
+`/v1/responses` 报 `401 insufficient permissions: Missing scopes: api.responses.write` 是 ChatGPT 登录态最常见的错误。脚本会:
+
+1. 在 `--check-scopes` / `--decode-token` 阶段打印 token 的 `scp`,让你提前看到是否带 `api.responses.write`
+2. 401 时在 stderr 单独打一行结构化警告:
+   ```
+   error=insufficient_scope; required=api.responses.write; http=401
+   ```
+3. token 缺少该 scope 时,即使走 `--refresh` 也没用 — Codex 公开 client_id `app_EMoamEEZ73f0CkXaXp7hrann` 在刷新时**不重新授予 scope**,新 token 的 `scp` 跟原 token 一致。
+
+**唯一能让 token 拿到 `api.responses.write` 的办法**是:在远程机器上 `codex logout && codex login`,浏览器里走完一次同意页,新写入的 `~/.codex/auth.json` 才会带 API scope。
+
+### 安全
+
+- `auth.json` / `OPENAI_API_KEY` / `refresh_token` 都是高敏数据,本项目已加进 `.gitignore`
+- 脚本不会打印 access_token / refresh_token 本体
+- `--decode-token refresh` 只显示前 6 字符 + 总长度
+- 用完含明文凭证的 `findings/` 目录请 `rm -rf`,并把它加进全局 `.gitignore`
+
+
 ## 安全备忘
 
 - `servers.yaml` 必须加进 `.gitignore`(本项目模板已加)
